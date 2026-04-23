@@ -178,6 +178,15 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Кэш обновлён")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("handler error", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await update.effective_chat.send_message(f"Ошибка: {context.error}")
+        except Exception:
+            pass
+
+
 @auth
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -202,6 +211,7 @@ def main():
     app.add_handler(CommandHandler("p", cmd_project))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(on_error)
     log.info("bot started, whitelist=%s", cfg.allowed_user_ids)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
