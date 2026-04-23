@@ -1,12 +1,13 @@
 import asyncio
-import datetime as dt
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any
 
+from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -16,8 +17,7 @@ from telegram.ext import (
 )
 
 import config
-from confluence import ConfluenceClient
-from parser import Mirror, ProjectData, parse_project
+from parser import Mirror, ProjectData
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,18 +26,19 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 cfg = config.load()
-client = ConfluenceClient(cfg.confluence_url, cfg.confluence_pat)
+if cfg.mode != "serve":
+    raise RuntimeError("bot.py must run with MODE=serve; use refresh_local.py on the mac")
 
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.json")
-REFRESH_INTERVAL = 24 * 3600
+os.makedirs(cfg.cache_dir, exist_ok=True)
+CACHE_FILE = os.path.join(cfg.cache_dir, "cache.json")
 
 _cache: dict[str, Any] = {"refreshed_at": None, "index": None, "pages": {}}
-_refresh_lock = asyncio.Lock()
+_refresh_flag: dict[str, Any] = {"requested_at": None}
 
 
 def load_cache_from_disk() -> None:
     if not os.path.exists(CACHE_FILE):
-        log.info("no cache file on disk")
+        log.info("no cache file on disk at %s", CACHE_FILE)
         return
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -57,52 +58,6 @@ def save_cache_to_disk() -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(_cache, f, ensure_ascii=False)
     os.replace(tmp, CACHE_FILE)
-
-
-def _refresh_sync() -> tuple[bool, str]:
-    try:
-        categories = client.get_children(cfg.root_page_id)
-        idx: dict[str, Any] = {"categories": {}, "by_basename": {}, "by_id": {}}
-        pages: dict[str, dict] = {}
-        for cat in categories:
-            cat_name = cat["title"]
-            cat_pages = client.get_children(cat["id"])
-            idx["categories"][cat_name] = []
-            for p in cat_pages:
-                entry = {"id": p["id"], "title": p["title"], "category": cat_name}
-                idx["categories"][cat_name].append(entry)
-                idx["by_id"][p["id"]] = entry
-                basename = p["title"].split(".")[0].lower()
-                idx["by_basename"].setdefault(basename, []).append(entry)
-                try:
-                    html = client.get_page_content(p["id"])
-                    data = parse_project(html)
-                    pages[p["id"]] = {
-                        "redirector": data.redirector,
-                        "mirrors": {
-                            name: {
-                                "name": m.name,
-                                "default_allow": m.default_allow,
-                                "deny": m.deny,
-                            }
-                            for name, m in data.mirrors.items()
-                        },
-                    }
-                except Exception:
-                    log.exception("parse page failed id=%s title=%s", p["id"], p["title"])
-        _cache["pages"] = pages
-        _cache["index"] = idx
-        _cache["refreshed_at"] = datetime.now(timezone.utc).isoformat()
-        save_cache_to_disk()
-        return True, f"pages={len(pages)}"
-    except Exception as e:
-        log.exception("refresh failed")
-        return False, str(e)
-
-
-async def do_refresh() -> tuple[bool, str]:
-    async with _refresh_lock:
-        return await asyncio.to_thread(_refresh_sync)
 
 
 def get_index() -> dict | None:
@@ -175,7 +130,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/projects — список проектов\n"
         "/p <project> [geo] — ссылка по гео\n"
         "/status — последнее обновление кэша\n"
-        "/refresh — обновить кэш сейчас (нужен VPN)"
+        "/refresh — запросить обновление кэша (нужен онлайн мак с VPN)"
     )
 
 
@@ -183,9 +138,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = get_index()
     if not idx:
-        await update.message.reply_text(
-            "Кэш пуст. Включи VPN и вызови /refresh."
-        )
+        await update.message.reply_text("Кэш пуст. Запусти refresh на маке.")
         return
     lines: list[str] = []
     for cat in sorted(idx["categories"]):
@@ -209,7 +162,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     idx = get_index()
     if not idx:
-        await update.message.reply_text("Кэш пуст. Включи VPN и вызови /refresh.")
+        await update.message.reply_text("Кэш пуст. Запусти refresh на маке.")
         return
 
     query = args[0].lower().split(".")[0].strip()
@@ -274,19 +227,29 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts = _cache.get("refreshed_at") or "никогда"
     n = len(_cache.get("pages") or {})
     cats = len((_cache.get("index") or {}).get("categories") or {})
+    flag_ts = _refresh_flag.get("requested_at")
+    flag_line = f"\nЗапрос refresh: {flag_ts}" if flag_ts else ""
     await update.message.reply_text(
-        f"Обновлён: {ts}\nКатегорий: {cats}\nСтраниц: {n}\nФайл: {CACHE_FILE}"
+        f"Обновлён: {ts}\nКатегорий: {cats}\nСтраниц: {n}{flag_line}"
     )
 
 
 @auth
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _refresh_lock.locked():
-        await update.message.reply_text("Уже обновляю, подожди…")
-        return
-    await update.message.reply_text("Обновляю…")
-    ok, msg = await do_refresh()
-    await update.message.reply_text(("✅ " if ok else "❌ ") + msg)
+    before = _cache.get("refreshed_at")
+    _refresh_flag["requested_at"] = datetime.now(timezone.utc).isoformat()
+    await update.message.reply_text("Запрос отправлен на мак, жду ответа…")
+
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        if _refresh_flag.get("requested_at") is None and _cache.get("refreshed_at") != before:
+            n = len(_cache.get("pages") or {})
+            await update.message.reply_text(f"✅ Обновлено. Страниц: {n}")
+            return
+
+    _refresh_flag["requested_at"] = None
+    await update.message.reply_text("❌ Мак спит или недоступен — разбуди и повтори /refresh")
 
 
 @auth
@@ -314,15 +277,63 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def scheduled_refresh(context: ContextTypes.DEFAULT_TYPE):
-    log.info("scheduled refresh starting")
-    ok, msg = await do_refresh()
-    log.info("scheduled refresh done ok=%s %s", ok, msg)
+def _check_secret(request: web.Request) -> bool:
+    return request.headers.get("X-Refresh-Secret") == cfg.refresh_secret
+
+
+async def http_health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "refreshed_at": _cache.get("refreshed_at")})
+
+
+async def http_get_flag(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.Response(status=401, text="unauthorized")
+    return web.json_response({"requested_at": _refresh_flag.get("requested_at")})
+
+
+async def http_put_cache(request: web.Request) -> web.Response:
+    if not _check_secret(request):
+        return web.Response(status=401, text="unauthorized")
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="invalid json")
+    if not isinstance(data, dict) or "refreshed_at" not in data:
+        return web.Response(status=400, text="missing refreshed_at")
+    _cache["refreshed_at"] = data["refreshed_at"]
+    _cache["index"] = data.get("index")
+    _cache["pages"] = data.get("pages") or {}
+    save_cache_to_disk()
+    _refresh_flag["requested_at"] = None
+    n = len(_cache["pages"])
+    log.info("cache received via HTTP, refreshed_at=%s pages=%d", _cache["refreshed_at"], n)
+    return web.json_response({"ok": True, "pages": n})
+
+
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", http_health)
+    app.router.add_get("/refresh-flag", http_get_flag)
+    app.router.add_post("/cache", http_put_cache)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=cfg.http_port)
+    await site.start()
+    log.info("http server listening on :%d", cfg.http_port)
+
+
+async def post_init(app: Application):
+    await run_http_server()
 
 
 def main():
     load_cache_from_disk()
-    app = Application.builder().token(cfg.tg_token).build()
+    app = (
+        Application.builder()
+        .token(cfg.tg_token)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("projects", cmd_projects))
@@ -332,13 +343,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
 
-    daily_hour = int(os.environ.get("DAILY_REFRESH_HOUR", "10"))
-    app.job_queue.run_daily(scheduled_refresh, time=dt.time(hour=daily_hour, minute=0))
-    if not _cache.get("index"):
-        app.job_queue.run_once(scheduled_refresh, when=3)
-    log.info("daily refresh scheduled at %02d:00 local", daily_hour)
-
-    log.info("bot started, whitelist=%s", cfg.allowed_user_ids)
+    log.info("bot started (serve mode), whitelist=%s cache_dir=%s", cfg.allowed_user_ids, cfg.cache_dir)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

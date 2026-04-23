@@ -7,4 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ENV MODE=serve
+ENV CACHE_DIR=/data
+RUN mkdir -p /data
+
 CMD ["python", "-u", "bot.py"]
