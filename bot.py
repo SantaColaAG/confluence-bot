@@ -1,5 +1,8 @@
+import asyncio
+import json
 import logging
-import time
+import os
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Any
 
@@ -13,7 +16,7 @@ from telegram.ext import (
 
 import config
 from confluence import ConfluenceClient
-from parser import ProjectData, parse_project
+from parser import Mirror, ProjectData, parse_project
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,8 +27,96 @@ log = logging.getLogger("bot")
 cfg = config.load()
 client = ConfluenceClient(cfg.confluence_url, cfg.confluence_pat)
 
-_index: dict[str, Any] = {"data": None, "ts": 0.0}
-_pages: dict[str, tuple[float, ProjectData]] = {}
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.json")
+REFRESH_INTERVAL = 24 * 3600
+
+_cache: dict[str, Any] = {"refreshed_at": None, "index": None, "pages": {}}
+_refresh_lock = asyncio.Lock()
+
+
+def load_cache_from_disk() -> None:
+    if not os.path.exists(CACHE_FILE):
+        log.info("no cache file on disk")
+        return
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _cache.update(data)
+        log.info(
+            "cache loaded, refreshed_at=%s pages=%d",
+            _cache.get("refreshed_at"),
+            len(_cache.get("pages") or {}),
+        )
+    except Exception:
+        log.exception("failed to load cache from disk")
+
+
+def save_cache_to_disk() -> None:
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_cache, f, ensure_ascii=False)
+    os.replace(tmp, CACHE_FILE)
+
+
+def _refresh_sync() -> tuple[bool, str]:
+    try:
+        categories = client.get_children(cfg.root_page_id)
+        idx: dict[str, Any] = {"categories": {}, "by_basename": {}, "by_id": {}}
+        pages: dict[str, dict] = {}
+        for cat in categories:
+            cat_name = cat["title"]
+            cat_pages = client.get_children(cat["id"])
+            idx["categories"][cat_name] = []
+            for p in cat_pages:
+                entry = {"id": p["id"], "title": p["title"], "category": cat_name}
+                idx["categories"][cat_name].append(entry)
+                idx["by_id"][p["id"]] = entry
+                basename = p["title"].split(".")[0].lower()
+                idx["by_basename"].setdefault(basename, []).append(entry)
+                try:
+                    html = client.get_page_content(p["id"])
+                    data = parse_project(html)
+                    pages[p["id"]] = {
+                        "redirector": data.redirector,
+                        "mirrors": {
+                            name: {
+                                "name": m.name,
+                                "default_allow": m.default_allow,
+                                "deny": m.deny,
+                            }
+                            for name, m in data.mirrors.items()
+                        },
+                    }
+                except Exception:
+                    log.exception("parse page failed id=%s title=%s", p["id"], p["title"])
+        _cache["pages"] = pages
+        _cache["index"] = idx
+        _cache["refreshed_at"] = datetime.now(timezone.utc).isoformat()
+        save_cache_to_disk()
+        return True, f"pages={len(pages)}"
+    except Exception as e:
+        log.exception("refresh failed")
+        return False, str(e)
+
+
+async def do_refresh() -> tuple[bool, str]:
+    async with _refresh_lock:
+        return await asyncio.to_thread(_refresh_sync)
+
+
+def get_index() -> dict | None:
+    return _cache.get("index")
+
+
+def get_project(page_id: str) -> ProjectData | None:
+    p = (_cache.get("pages") or {}).get(page_id)
+    if not p:
+        return None
+    mirrors = {
+        name: Mirror(name=m["name"], default_allow=m["default_allow"], deny=list(m["deny"]))
+        for name, m in p.get("mirrors", {}).items()
+    }
+    return ProjectData(redirector=dict(p.get("redirector", {})), mirrors=mirrors)
 
 
 def auth(fn):
@@ -41,40 +132,6 @@ def auth(fn):
             return
         return await fn(update, context)
     return wrapper
-
-
-def get_index(force: bool = False) -> dict:
-    now = time.time()
-    if not force and _index["data"] and now - _index["ts"] < cfg.cache_ttl:
-        return _index["data"]
-
-    categories = client.get_children(cfg.root_page_id)
-    idx: dict[str, Any] = {"categories": {}, "by_basename": {}, "by_id": {}}
-    for cat in categories:
-        cat_name = cat["title"]
-        pages = client.get_children(cat["id"])
-        idx["categories"][cat_name] = []
-        for p in pages:
-            entry = {"id": p["id"], "title": p["title"], "category": cat_name}
-            idx["categories"][cat_name].append(entry)
-            idx["by_id"][p["id"]] = entry
-            basename = p["title"].split(".")[0].lower()
-            idx["by_basename"].setdefault(basename, []).append(entry)
-
-    _index["data"] = idx
-    _index["ts"] = now
-    return idx
-
-
-def get_project(page_id: str) -> ProjectData:
-    now = time.time()
-    cached = _pages.get(page_id)
-    if cached and now - cached[0] < cfg.cache_ttl:
-        return cached[1]
-    html = client.get_page_content(page_id)
-    data = parse_project(html)
-    _pages[page_id] = (now, data)
-    return data
 
 
 def _format_project(entry: dict, data: ProjectData, geo: str | None) -> str:
@@ -103,14 +160,11 @@ def _format_project(entry: dict, data: ProjectData, geo: str | None) -> str:
 
 async def _send_project(update: Update, entry: dict, geo: str | None):
     chat = update.effective_chat
-    try:
-        data = get_project(entry["id"])
-    except Exception as e:
-        log.exception("fetch failed")
-        await chat.send_message(f"Ошибка загрузки: {e}")
+    data = get_project(entry["id"])
+    if not data:
+        await chat.send_message(f"Нет данных по странице {entry['title']} в кэше")
         return
-    text = _format_project(entry, data, geo)
-    await chat.send_message(text, parse_mode="Markdown")
+    await chat.send_message(_format_project(entry, data, geo), parse_mode="Markdown")
 
 
 @auth
@@ -119,13 +173,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/projects — список проектов\n"
         "/p <project> [geo] — ссылка по гео\n"
-        "/refresh — сбросить кэш"
+        "/status — последнее обновление кэша\n"
+        "/refresh — обновить кэш сейчас (нужен VPN)"
     )
 
 
 @auth
 async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = get_index()
+    if not idx:
+        await update.message.reply_text(
+            "Кэш пуст. Включи VPN и вызови /refresh."
+        )
+        return
     lines: list[str] = []
     for cat in sorted(idx["categories"]):
         pages = sorted(idx["categories"][cat], key=lambda x: x["title"])
@@ -145,10 +205,15 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text("Usage: /p <project> [geo]\nПример: /p blitz-bet DE")
         return
+
+    idx = get_index()
+    if not idx:
+        await update.message.reply_text("Кэш пуст. Включи VPN и вызови /refresh.")
+        return
+
     name = args[0].lower().split(".")[0]
     geo = args[1] if len(args) > 1 else None
 
-    idx = get_index()
     matches = idx["by_basename"].get(name, [])
     if not matches:
         similar = sorted({b for b in idx["by_basename"] if name in b or b in name})[:10]
@@ -172,19 +237,23 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @auth
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ts = _cache.get("refreshed_at") or "никогда"
+    n = len(_cache.get("pages") or {})
+    cats = len((_cache.get("index") or {}).get("categories") or {})
+    await update.message.reply_text(
+        f"Обновлён: {ts}\nКатегорий: {cats}\nСтраниц: {n}\nФайл: {CACHE_FILE}"
+    )
+
+
+@auth
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _pages.clear()
-    get_index(force=True)
-    await update.message.reply_text("Кэш обновлён")
-
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("handler error", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_chat:
-        try:
-            await update.effective_chat.send_message(f"Ошибка: {context.error}")
-        except Exception:
-            pass
+    if _refresh_lock.locked():
+        await update.message.reply_text("Уже обновляю, подожди…")
+        return
+    await update.message.reply_text("Обновляю…")
+    ok, msg = await do_refresh()
+    await update.message.reply_text(("✅ " if ok else "❌ ") + msg)
 
 
 @auth
@@ -196,22 +265,45 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, page_id, geo_tag = q.data.split(":", 2)
     geo = None if geo_tag == "-" else geo_tag
     idx = get_index()
-    entry = idx["by_id"].get(page_id)
+    entry = (idx or {}).get("by_id", {}).get(page_id)
     if not entry:
         await q.message.reply_text("Запись устарела, попробуйте снова.")
         return
     await _send_project(update, entry, geo)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("handler error", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await update.effective_chat.send_message(f"Ошибка: {context.error}")
+        except Exception:
+            pass
+
+
+async def scheduled_refresh(context: ContextTypes.DEFAULT_TYPE):
+    log.info("scheduled refresh starting")
+    ok, msg = await do_refresh()
+    log.info("scheduled refresh done ok=%s %s", ok, msg)
+
+
 def main():
+    load_cache_from_disk()
     app = Application.builder().token(cfg.tg_token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("p", cmd_project))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
+
+    first_delay = 10 if _cache.get("index") else 3
+    app.job_queue.run_repeating(
+        scheduled_refresh, interval=REFRESH_INTERVAL, first=first_delay
+    )
+
     log.info("bot started, whitelist=%s", cfg.allowed_user_ids)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
