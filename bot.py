@@ -236,9 +236,30 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    geo_tag = geo if geo else "-"
+    if geo:
+        geo_u = geo.upper()
+        lines = [f"*Найдено {len(matches)} по '{query}' / {geo_u}:*", ""]
+        for m in matches:
+            data = get_project(m["id"])
+            if not data or not data.redirector:
+                lines.append(f"• {m['title']} — нет данных")
+                continue
+            target = data.redirector.get(geo.lower()) or data.redirector.get("default")
+            if not target:
+                lines.append(f"• {m['title']} — нет {geo_u}")
+                continue
+            mirror = data.mirrors.get(target)
+            warn = ""
+            if mirror and geo_u in mirror.deny:
+                warn = " ⚠️DENY"
+            elif mirror and not mirror.default_allow:
+                warn = " ⚠️not ALLOW"
+            lines.append(f"• {m['title']} → `{target}`{warn}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
     keyboard = [
-        [InlineKeyboardButton(m["title"], callback_data=f"p:{m['id']}:{geo_tag}")]
+        [InlineKeyboardButton(m["title"], callback_data=f"p:{m['id']}:-")]
         for m in matches
     ]
     await update.message.reply_text(
