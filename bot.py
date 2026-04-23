@@ -211,18 +211,29 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Кэш пуст. Включи VPN и вызови /refresh.")
         return
 
-    name = args[0].lower().split(".")[0]
+    query = args[0].lower().split(".")[0].strip()
     geo = args[1] if len(args) > 1 else None
 
-    matches = idx["by_basename"].get(name, [])
+    matches: list[dict] = []
+    for pages in idx["categories"].values():
+        for p in pages:
+            if query in p["title"].lower():
+                matches.append(p)
+
     if not matches:
-        similar = sorted({b for b in idx["by_basename"] if name in b or b in name})[:10]
-        hint = "\nПохожие: " + ", ".join(similar) if similar else ""
-        await update.message.reply_text(f"Не найдено: {name}{hint}")
+        await update.message.reply_text(f"Не найдено: {query}")
         return
 
     if len(matches) == 1:
         await _send_project(update, matches[0], geo)
+        return
+
+    if len(matches) > 20:
+        titles = ", ".join(p["title"] for p in matches[:20])
+        await update.message.reply_text(
+            f"Слишком много совпадений ({len(matches)}). Уточни запрос.\n"
+            f"Первые 20: {titles}"
+        )
         return
 
     geo_tag = geo if geo else "-"
@@ -231,7 +242,7 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for m in matches
     ]
     await update.message.reply_text(
-        f"Несколько проектов '{name}':",
+        f"Найдено {len(matches)} проектов по '{query}':",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
