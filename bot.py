@@ -1,4 +1,5 @@
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -331,10 +332,11 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
 
-    first_delay = 10 if _cache.get("index") else 3
-    app.job_queue.run_repeating(
-        scheduled_refresh, interval=REFRESH_INTERVAL, first=first_delay
-    )
+    daily_hour = int(os.environ.get("DAILY_REFRESH_HOUR", "10"))
+    app.job_queue.run_daily(scheduled_refresh, time=dt.time(hour=daily_hour, minute=0))
+    if not _cache.get("index"):
+        app.job_queue.run_once(scheduled_refresh, when=3)
+    log.info("daily refresh scheduled at %02d:00 local", daily_hour)
 
     log.info("bot started, whitelist=%s", cfg.allowed_user_ids)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
