@@ -291,6 +291,13 @@ async def http_get_flag(request: web.Request) -> web.Response:
     return web.json_response({"requested_at": _refresh_flag.get("requested_at")})
 
 
+async def http_get_cache(request: web.Request) -> web.Response:
+    # Выдача кэша наружу (для браузерного расширения). Тот же секрет, что у refresh.
+    if not _check_secret(request):
+        return web.Response(status=401, text="unauthorized")
+    return web.json_response(_cache)
+
+
 async def http_put_cache(request: web.Request) -> web.Response:
     if not _check_secret(request):
         return web.Response(status=401, text="unauthorized")
@@ -314,6 +321,7 @@ async def run_http_server():
     app = web.Application()
     app.router.add_get("/", http_health)
     app.router.add_get("/refresh-flag", http_get_flag)
+    app.router.add_get("/cache", http_get_cache)
     app.router.add_post("/cache", http_put_cache)
     runner = web.AppRunner(app)
     await runner.setup()
